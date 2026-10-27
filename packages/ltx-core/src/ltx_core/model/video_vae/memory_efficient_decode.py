@@ -120,6 +120,73 @@ def _pad_workspace_temporal(workspace: torch.Tensor) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _conv_into(conv: nn.Conv3d, x: torch.Tensor, dest: torch.Tensor) -> None:
+    """``dest[...] = conv(x)`` with the bias added while writing ``dest``.
+
+    ``aten::_convolution`` runs cuDNN without the bias and then adds it in place
+    (``output.add_(bias)``), after which the assignment copies the result: two
+    passes over the output.  Adding the bias into ``dest`` is the same
+    ``bf16(conv + bias)``, bit for bit, in one pass (ltx-vae overlay).
+    """
+    if conv.bias is None or conv.padding_mode != "zeros":
+        dest.copy_(conv(x))
+        return
+    # The depth-to-space upsampling convolutions (4096 output channels): cuDNN
+    # picks a split-K kernel at ~25% of the BF16 peak for the full width, the
+    # same kernel family at ~55% for 1024 channels at a time -- bit for bit the
+    # same outputs (tests/bench_vae_upsample_conv.py, test_ltx_vae_fused.py).
+    # Every group is computed before any is written: ``x`` may be a view of the
+    # workspace that ``dest`` overwrites (in-place convolution).
+    width = 1024 if conv.out_channels > 1024 and conv.out_channels % 1024 == 0 and conv.groups == 1 else conv.out_channels
+    outs = [F.conv3d(x, conv.weight[first:first + width], None, conv.stride, conv.padding, conv.dilation, conv.groups)
+            for first in range(0, conv.out_channels, width)]
+    for out, first in zip(outs, range(0, conv.out_channels, width)):
+        torch.add(out, conv.bias[first:first + width].view(1, -1, 1, 1, 1), out=dest[:, first:first + width])
+
+
+def _conv3d_temporal_chunked_add(workspace: torch.Tensor, conv: nn.Conv3d, residual: torch.Tensor) -> None:
+    """``residual += conv(workspace)`` over the same temporal chunks as
+    :func:`inplace_conv3d_temporal_chunked`, without writing the workspace.
+
+    For the second convolution of a mid-block resnet, whose output is only added
+    to the hidden state: the original writes ``bf16(conv + bias)`` into the
+    workspace (bias add and copy) and the caller then adds the whole interior to
+    the hidden state.  Here each chunk's ``bf16(conv + bias)`` is added to the
+    hidden state directly -- the same two roundings, bit for bit, two passes
+    fewer -- and since the workspace is only read, the chunks need no boundary
+    save/restore.  Chunk boundaries (hence cuDNN problem shapes) are unchanged.
+    """
+    if conv.kernel_size != (3, 3, 3) or conv.stride != (1, 1, 1) or conv.padding != (0, 1, 1):
+        raise ValueError(f"unsupported conv {conv}")
+    _pad_workspace_temporal(workspace)
+    total_frames = workspace.shape[2]
+    in_channels = conv.in_channels
+    if total_frames > 16:
+        split_size = _find_temporal_split_size(total_frames)
+        num_splits = (total_frames + split_size - 1) // split_size
+    else:
+        split_size = total_frames - 1
+        num_splits = 1
+    needs_clone = workspace.untyped_storage().nbytes() > (2**31 - 1) * workspace.element_size()
+
+    def _chunk(t_start: int, t_end: int) -> torch.Tensor:
+        s = workspace[:, :in_channels, t_start:t_end]
+        return s.clone() if needs_clone else s
+
+    def _add(t_start: int, t_end: int, out_start: int) -> None:
+        out = F.conv3d(_chunk(t_start, t_end), conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
+        if conv.bias is not None:
+            out.add_(conv.bias.view(1, -1, 1, 1, 1))
+        residual[:, :, out_start:out_start + out.shape[2]].add_(out)
+
+    # Output workspace frames [1, split_size) and [start, end) are residual frames one lower.
+    _add(0, split_size + 1, 0)
+    for i in range(1, num_splits):
+        start = i * split_size
+        end = min((i + 1) * split_size, total_frames - 1)
+        _add(start - 1, end + 1, start - 1)
+
+
 def inplace_conv3d_temporal_chunked(workspace: torch.Tensor, conv: nn.Conv3d) -> None:
     """Run a 3x3x3 Conv3d in-place on a temporally-padded workspace.
     The workspace has shape ``[B, C, T+2, H, W]`` where positions ``[1:-1]``
@@ -188,7 +255,7 @@ def inplace_conv3d_temporal_chunked(workspace: torch.Tensor, conv: nn.Conv3d) ->
         # would be a wasted full HW slice copy.
         x_buf[:, :, 0].copy_(workspace[:, :, split_size - 1] if direct_boundary_copy
                              else workspace[:, :, split_size - 1].clone())
-    workspace[:, :out_channels, 1:split_size] = conv(_chunk(0, split_size + 1))
+    _conv_into(conv, _chunk(0, split_size + 1), workspace[:, :out_channels, 1:split_size])
 
     # --- Remaining chunks ---
     for i in range(1, num_splits):
@@ -205,7 +272,7 @@ def inplace_conv3d_temporal_chunked(workspace: torch.Tensor, conv: nn.Conv3d) ->
             x_buf[:, :, 0].copy_(workspace[:, :, end - 1] if direct_boundary_copy
                                  else workspace[:, :, end - 1].clone())
 
-        workspace[:, :out_channels, start:end] = conv(_chunk(start - 1, end + 1))
+        _conv_into(conv, _chunk(start - 1, end + 1), workspace[:, :out_channels, start:end])
 
         # Put back the previous chunk's output at the boundary.
         workspace[:, :, start - 1] = o_buf[:, :, 0]
@@ -306,8 +373,11 @@ def _resnet_block_forward_inplace(
     causal: bool,
     timestep: torch.Tensor | None,
     generator: torch.Generator | None,
-) -> None:
+    residual: torch.Tensor | None = None,
+) -> bool:
     """Run a ``ResnetBlock3D`` in-place on a workspace buffer.
+    With ``residual`` (ltx-vae overlay) the second convolution is added to it
+    directly where possible; returns whether it was.
     The workspace has shape ``[B, C, T+2, H, W]`` with real data in
     ``[1:-1]``.  After this call ``workspace[:, :, 1:-1]`` holds the
     residual-branch output ``F(x)`` (without the skip connection --
@@ -359,6 +429,10 @@ def _resnet_block_forward_inplace(
     _spark_norm_silu(resnet.norm2, interior, affine2)
     # dropout is always 0.0 during inference -- skip.
 
+    if residual is not None and not causal and not resnet.inject_noise:
+        _conv3d_temporal_chunked_add(workspace, resnet.conv2.conv, residual)
+        return True
+
     if causal:
         result = resnet.conv2(interior, causal=True)
         interior.copy_(result)
@@ -371,6 +445,7 @@ def _resnet_block_forward_inplace(
         scale = resnet.per_channel_scale2.to(device=interior.device, dtype=interior.dtype)
         noise = torch.randn(spatial_shape, device=interior.device, dtype=interior.dtype, generator=generator)
         interior.add_((noise * scale)[None, :, None, ...])
+    return False
 
 
 def _midblock_forward_efficient(
@@ -411,8 +486,8 @@ def _midblock_forward_efficient(
 
     for resnet in block.res_blocks:
         workspace[:, :, 1:-1].copy_(hidden_states)
-        _resnet_block_forward_inplace(resnet, workspace, causal, timestep_embed, generator)
-        hidden_states.add_(workspace[:, :, 1:-1])
+        if not _resnet_block_forward_inplace(resnet, workspace, causal, timestep_embed, generator, hidden_states):
+            hidden_states.add_(workspace[:, :, 1:-1])
 
     del workspace
     return hidden_states
