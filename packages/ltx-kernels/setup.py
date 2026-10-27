@@ -276,10 +276,10 @@ if __name__ == "__main__":
             include_dirs=[str(ROOT / "csrc/ops/include"), *_nvidia_include_dirs()],
             library_dirs=cuda_link_dirs,
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
+                "cxx": ["-O3", "-std=c++20"],
                 "nvcc": [
                     "-O3",
-                    "-std=c++17",
+                    "-std=c++20",
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "-U__CUDA_NO_HALF_CONVERSIONS__",
                     "-U__CUDA_NO_HALF2_OPERATORS__",
@@ -307,10 +307,10 @@ if __name__ == "__main__":
         "csrc/blockwise/kernels/geforce/gemm.cu",
     ]
     abi = f"-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}"
-    blockwise_cxx = ["-O3", "-std=c++17", "-fPIC", "-Wno-psabi", "-Wno-deprecated-declarations", abi]
+    blockwise_cxx = ["-O3", "-std=c++20", "-fPIC", "-Wno-psabi", "-Wno-deprecated-declarations", abi]
     blockwise_nvcc = [
         "-O3",
-        "-std=c++17",
+        "-std=c++20",
         "--ptxas-options=-O2",
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
@@ -367,10 +367,10 @@ if __name__ == "__main__":
                 libraries=["cublasLt"],
                 library_dirs=cuda_link_dirs,
                 extra_compile_args={
-                    "cxx": ["-O3", "-std=c++17"],
+                    "cxx": ["-O3", "-std=c++20"],
                     "nvcc": [
                         "-O3",
-                        "-std=c++17",
+                        "-std=c++20",
                         "--expt-relaxed-constexpr",
                         "--expt-extended-lambda",
                         "-U__CUDA_NO_HALF_OPERATORS__",
