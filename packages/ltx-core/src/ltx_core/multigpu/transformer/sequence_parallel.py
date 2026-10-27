@@ -8,6 +8,7 @@ using sequence parallelism. It:
 - Gathers all tokens back to all GPUs after the forward pass
 """
 
+import os
 from dataclasses import replace
 from itertools import accumulate
 
@@ -293,6 +294,14 @@ class SequenceParallelModelWrapper(torch.nn.Module):
         if video is None:
             return self.model(video, audio, perturbations)
 
+        if os.environ.get("SPARK_CP_SHARDED_STATE") == "1":
+            token_counts = [video.latent.shape[1]] * self.attention_manager.world_size
+            self.attention_manager.set_seqlen_all2all(token_counts)
+            if os.environ.get("SPARK_CP_STEP_BARRIER", "1") == "1":
+                with torch.cuda.nvtx.range("Spark/LTX/communication/step_barrier"):
+                    torch.distributed.barrier(self.attention_manager.group)
+            return self.model(video, audio, perturbations)
+
         # Pad the video seq dim up to a multiple of world_size so all ranks get
         # equal shards. The attention mask we attach makes the padded keys
         # invisible to attention; padded rows are sliced off after the gather.
@@ -308,9 +317,12 @@ class SequenceParallelModelWrapper(torch.nn.Module):
                 f"({self.attention_manager.max_tokens}). Use a smaller resolution or fewer frames."
             )
         self.attention_manager.set_seqlen_all2all(token_counts)
-        torch.distributed.barrier(self.attention_manager.group)
+        if os.environ.get("SPARK_CP_STEP_BARRIER", "1") == "1":
+            with torch.cuda.nvtx.range("Spark/LTX/communication/step_barrier"):
+                torch.distributed.barrier(self.attention_manager.group)
         video, audio = self.model(video_tile, audio, perturbations)
-        video = gather_output_tokens(video, token_counts, self.attention_manager.group)
+        with torch.cuda.nvtx.range("Spark/LTX/communication/step_prediction_AllGather"):
+            video = gather_output_tokens(video, token_counts, self.attention_manager.group)
         # Unpad: drop the rows we added in `pad_modality_for_uniform_sharding` to make
         # the seq dim divisible by world_size, restoring the caller's original length.
         if video.shape[1] != t_orig:

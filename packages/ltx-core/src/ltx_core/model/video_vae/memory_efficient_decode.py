@@ -45,6 +45,7 @@ module op only formats activations and installs the workspace forward.
 from __future__ import annotations
 
 import math
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -178,12 +179,15 @@ def inplace_conv3d_temporal_chunked(workspace: torch.Tensor, conv: nn.Conv3d) ->
         s = workspace[:, :in_channels, t_start:t_end]
         return s.clone() if needs_clone else s
 
+    direct_boundary_copy = os.environ.get("SPARK_CP_VAE_DIRECT_COPY", "0") == "1"
+
     # --- First chunk ---
     if num_splits > 1:
         # Save the boundary now so the loop below can restore it.  Skipped
         # when there is only one chunk: the loop never runs, and the save
         # would be a wasted full HW slice copy.
-        x_buf[:, :, 0] = workspace[:, :, split_size - 1].clone()
+        x_buf[:, :, 0].copy_(workspace[:, :, split_size - 1] if direct_boundary_copy
+                             else workspace[:, :, split_size - 1].clone())
     workspace[:, :out_channels, 1:split_size] = conv(_chunk(0, split_size + 1))
 
     # --- Remaining chunks ---
@@ -192,11 +196,14 @@ def inplace_conv3d_temporal_chunked(workspace: torch.Tensor, conv: nn.Conv3d) ->
         end = min((i + 1) * split_size, total_frames - 1)
 
         # Save the value at start-1 (now holds previous chunk's output).
-        o_buf[:, :, 0] = workspace[:, :, start - 1].clone()
+        o_buf[:, :, 0].copy_(workspace[:, :, start - 1] if direct_boundary_copy
+                             else workspace[:, :, start - 1].clone())
         # Restore the original input value needed by this chunk's conv.
         workspace[:, :, start - 1] = x_buf[:, :, 0]
         # Save the boundary for the *next* chunk before we overwrite it.
-        x_buf[:, :, 0] = workspace[:, :, end - 1].clone()
+        if not direct_boundary_copy or i + 1 < num_splits:
+            x_buf[:, :, 0].copy_(workspace[:, :, end - 1] if direct_boundary_copy
+                                 else workspace[:, :, end - 1].clone())
 
         workspace[:, :out_channels, start:end] = conv(_chunk(start - 1, end + 1))
 
@@ -275,6 +282,24 @@ def _norm_inplace(norm: nn.Module, x: torch.Tensor) -> None:
 # ---------------------------------------------------------------------------
 
 
+
+def _spark_norm_silu(
+    norm: nn.Module,
+    x: torch.Tensor,
+    affine: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> None:
+    """Fuse eligible BF16 PixelNorm paths, retaining the original fallback."""
+    enabled = os.environ.get("SPARK_LTX_V2_MODE", "native") in ("norm", "norm_qkv", "combined")
+    if enabled and isinstance(norm, PixelNorm) and x.dtype == torch.bfloat16 and x.is_cuda:
+        from runtime.stage2_ops.spark_v2.pixelnorm import pixel_norm_silu_
+        pixel_norm_silu_(x, norm.eps, affine)
+        return
+    _norm_inplace(norm, x)
+    if affine is not None:
+        scale, shift = affine
+        x.mul_(1 + scale).add_(shift)
+    F.silu(x, inplace=True)
+
 def _resnet_block_forward_inplace(
     resnet: ResnetBlock3D,
     workspace: torch.Tensor,
@@ -299,7 +324,7 @@ def _resnet_block_forward_inplace(
     interior = workspace[:, :, 1:-1]
 
     # --- norm1 + [ada scaling] + SiLU + conv1 ---
-    _norm_inplace(resnet.norm1, interior)
+    affine1 = affine2 = None
 
     if resnet.timestep_conditioning and timestep is not None:
         ada = resnet.scale_shift_table[None, ..., None, None, None].to(
@@ -313,9 +338,9 @@ def _resnet_block_forward_inplace(
             timestep.shape[-1],
         )
         shift1, scale1, shift2, scale2 = ada.unbind(dim=1)
-        interior.mul_(1 + scale1).add_(shift1)
+        affine1, affine2 = (scale1, shift1), (scale2, shift2)
 
-    F.silu(interior, inplace=True)
+    _spark_norm_silu(resnet.norm1, interior, affine1)
 
     if causal:
         result = resnet.conv1(interior, causal=True)
@@ -331,12 +356,7 @@ def _resnet_block_forward_inplace(
         interior.add_((noise * scale)[None, :, None, ...])
 
     # --- norm2 + [ada scaling] + SiLU + conv2 ---
-    _norm_inplace(resnet.norm2, interior)
-
-    if resnet.timestep_conditioning and timestep is not None:
-        interior.mul_(1 + scale2).add_(shift2)  # type: ignore[possibly-undefined]
-
-    F.silu(interior, inplace=True)
+    _spark_norm_silu(resnet.norm2, interior, affine2)
     # dropout is always 0.0 during inference -- skip.
 
     if causal:
@@ -495,7 +515,7 @@ def _final_norm_and_conv_out(
     del sample
 
     interior = workspace[:, :feature_channels, 1:-1]
-    _norm_inplace(decoder.conv_norm_out, interior)
+    affine = None
 
     if decoder.timestep_conditioning:
         embedded_timestep = decoder.last_time_embedder(
@@ -514,9 +534,9 @@ def _final_norm_and_conv_out(
             embedded_timestep.shape[-1],
         )
         shift, scale = ada_values.unbind(dim=1)
-        interior.mul_(1 + scale).add_(shift)
+        affine = (scale, shift)
 
-    F.silu(interior, inplace=True)
+    _spark_norm_silu(decoder.conv_norm_out, interior, affine)
 
     if causal:
         # Causal: build padded tensor directly from the interior view,

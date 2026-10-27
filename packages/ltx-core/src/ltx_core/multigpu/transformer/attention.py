@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -27,8 +29,9 @@ class AttentionManager:
         self.world_size = dist.get_world_size(group)
         self.max_tokens = max_tokens
         hidden_dim = num_heads * head_dim
-        num_sms = torch.cuda.get_device_properties(self.rank).multi_processor_count
+        num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         self.copy_out = copy_out_
+        self.async_qkv = os.environ.get("SPARK_CP_ASYNC_QKV", "0") == "1"
         buffer_seqlen = (max_tokens + self.world_size - 1) // self.world_size
         self.all2all_heads, self.all2all_q = (
             All2All(
@@ -86,6 +89,9 @@ class AttentionManager:
     def send_recv_qkv(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.async_qkv:
+            t_q, t_k, t_v = self.all2all_q.send_recv_async([q, k, v], copy_out=self.copy_out)
+            return t_q, t_k, t_v
         t_q = self.all2all_q.send_recv_heads(q, copy_out=self.copy_out)
         t_k = self.all2all_k.send_recv_heads(k, copy_out=self.copy_out)
         t_v = self.all2all_v.send_recv_heads(v, copy_out=self.copy_out)
@@ -197,8 +203,11 @@ class _AudioAll2AllRedistribute:
         v = v.view(v.shape[0], v.shape[1], heads, head_dim)
 
         t_q = q[:, :, heads_per_rank * rank : heads_per_rank * (rank + 1), :].clone()
-        t_k = self.manager.all2all_k.send_recv_heads(k, copy_out=self.manager.copy_out)
-        t_v = self.manager.all2all_v.send_recv_heads(v, copy_out=self.manager.copy_out)
+        if self.manager.async_qkv:
+            t_k, t_v = self.manager.all2all_k.send_recv_async([k, v], copy_out=self.manager.copy_out)
+        else:
+            t_k = self.manager.all2all_k.send_recv_heads(k, copy_out=self.manager.copy_out)
+            t_v = self.manager.all2all_v.send_recv_heads(v, copy_out=self.manager.copy_out)
 
         # `flatten` / `unflatten` collapse only the head dims, avoiding a `-1` in the
         # seq position -- that would otherwise be ambiguous if the seq is 0 for a
