@@ -20,6 +20,34 @@ from ltx_core.model.transformer.rope import (
 KeyframesEmbeddingProvider = Callable[[], torch.Tensor | None]
 
 
+def _collapse_uniform_timesteps(timestep: torch.Tensor) -> torch.Tensor:
+    """Return a ``(B, 1)`` view when every token of a per-token ``(B, T, ...)`` sigma tensor holds the same value.
+
+    Per-token timesteps that all hold the same sigma (no conditioning tokens) give identical AdaLN rows; embedding one
+    row skips ``T - 1`` copies of the timestep MLP and AdaLN GEMMs, and the blocks broadcast that row instead of
+    streaming ``T`` copies from memory. Any difference keeps the per-token tensor.
+    """
+    if timestep.ndim < 2:
+        return timestep
+    rows = timestep.reshape(timestep.shape[0], -1)
+    if rows.shape[1] == 1:
+        return rows
+    collapsed = bool(torch.equal(rows, rows[:, :1].expand_as(rows)))
+    _report_collapse(tuple(timestep.shape), collapsed)
+    return rows[:, :1] if collapsed else timestep
+
+
+_REPORTED: set[tuple[tuple[int, ...], bool]] = set()
+
+
+def _report_collapse(shape: tuple[int, ...], collapsed: bool) -> None:
+    # One line per shape and outcome, so a validation run shows whether the one-row path engaged.
+    if (shape, collapsed) not in _REPORTED:
+        _REPORTED.add((shape, collapsed))
+        print(f"[sol-v2 adaln-pre] timesteps {shape} {'uniform -> one row' if collapsed else 'differ -> per-token'}",
+              flush=True)
+
+
 def apply_keyframes_absolute_embedding(
     hidden_states: torch.Tensor,
     keyframes_mask: torch.Tensor | None,
@@ -174,7 +202,7 @@ class TransformerArgsPreprocessor:
         self, timestep: torch.Tensor, adaln: AdaLayerNormSingle, batch_size: int, hidden_dtype: torch.dtype
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Prepare timestep embeddings."""
-        timestep_scaled = timestep * self.timestep_scale_multiplier
+        timestep_scaled = _collapse_uniform_timesteps(timestep) * self.timestep_scale_multiplier
         timestep, embedded_timestep = adaln(
             timestep_scaled.flatten(),
             hidden_dtype=hidden_dtype,
@@ -397,7 +425,7 @@ class MultiModalTransformerArgsPreprocessor:
         av_ca_factor = self.av_ca_timestep_scale_multiplier / timestep_scale_multiplier
 
         scale_shift_timestep, _ = self.cross_scale_shift_adaln(
-            (modality_timesteps * timestep_scale_multiplier).flatten(),
+            (_collapse_uniform_timesteps(modality_timesteps) * timestep_scale_multiplier).flatten(),
             hidden_dtype=hidden_dtype,
         )
         scale_shift_timestep = scale_shift_timestep.view(batch_size, -1, scale_shift_timestep.shape[-1])
