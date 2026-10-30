@@ -78,6 +78,15 @@ class AttentionManager:
             ranks = dist.get_process_group_ranks(group) if group is not None else list(range(self.world_size))
             self.pipeline_group = dist.new_group(ranks=ranks, backend="nccl", pg_options=options)
             self.pipeline_stream = torch.cuda.Stream(priority=-1)
+        # Optional transport for the pipeline's exchanges instead of NCCL (2 ranks), set by the caller:
+        # pipeline_transport_factory(group, nbytes, slots) -> transport, slots = [(send_off, recv_off, bytes)] of one
+        # send and one receive buffer, the transport offering view(which, offset, shape, dtype) -> tensor,
+        # post(slot, stream), wait(slot, stream), error() and close() (e.g. Sol-H3-Spark's spark_rdma: RDMA from
+        # host-pinned buffers on DGX Spark, which has no GPUDirect RDMA). Created at the first pipelined call for
+        # that call's shape (other shapes keep NCCL); if creating it fails on either rank, both keep NCCL.
+        self.pipeline_transport_factory = None
+        self.pipeline_transport = None
+        self.pipeline_transport_key = None
 
     def set_seqlen_all2all(self, seqlens: list[int]) -> None:
         # Route through the wrappers so the registered custom ops' fake-impl
@@ -225,9 +234,45 @@ class PipelinedAll2AllAttention(AttentionCallable):
     def _reference_outside_graph(self, q, k, v, heads):
         return self._reference(q, k, v, heads)
 
+    def _transport(self, key: tuple, t: int, hg: int, head_dim: int, groups: int, dtype: torch.dtype):
+        """The manager's pipeline transport for this shape, created on first use (collective on both ranks)."""
+        manager = self.manager
+        if manager.pipeline_transport_factory is None or manager.world_size != 2:
+            return None
+        if manager.pipeline_transport_key is None:
+            manager.pipeline_transport_key = key
+            esize = torch.empty((), dtype=dtype).element_size()
+            bq, bo = 3 * t * hg * head_dim * esize, t * hg * head_dim * esize
+            slots = ([(g * bq, g * bq, bq) for g in range(groups)]
+                     + [(groups * bq + g * bo, groups * bq + g * bo, bo) for g in range(groups)])
+            transport, error = None, None
+            try:
+                transport = manager.pipeline_transport_factory(manager.group, groups * (bq + bo), slots)
+            except Exception as exc:  # noqa: BLE001 -- any failure means NCCL on both ranks
+                error = exc
+            ok = torch.tensor([0 if transport is None else 1], dtype=torch.int32, device="cuda")
+            dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=manager.group)
+            if int(ok.item()) == 1:
+                manager.pipeline_transport = transport
+                print(f"[v4 transport] rank {manager.rank}: {type(transport).__name__}, {len(slots)} slots, "
+                      f"{groups * (bq + bo) / 2**20:.1f} MiB each way, shape {key}", flush=True)
+            else:
+                if transport is not None:
+                    transport.close()
+                print(f"[v4 transport] rank {manager.rank}: unavailable ({error or 'failed on the peer'}), "
+                      f"the pipeline keeps NCCL", flush=True)
+        return manager.pipeline_transport if manager.pipeline_transport_key == key else None
+
     @torch.compiler.disable
     def _pipelined(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, groups: int) -> torch.Tensor:
         manager = self.manager
+        if manager.pipeline_transport_factory is not None:
+            _, t, hidden = q.shape
+            hg, head_dim = heads // manager.world_size // groups, hidden // heads
+            transport = self._transport((groups, manager.world_size, t, hg, head_dim, q.dtype), t, hg, head_dim,
+                                        groups, q.dtype)
+            if transport is not None:
+                return self._pipelined_transport(transport, q, k, v, heads, groups)
         world, rank, group, comm = manager.world_size, manager.rank, manager.pipeline_group, manager.pipeline_stream
         _, t, hidden = q.shape
         head_dim = hidden // heads
@@ -293,6 +338,80 @@ class PipelinedAll2AllAttention(AttentionCallable):
                   f"exchange {same}", flush=True)
             if not same:
                 raise RuntimeError("pipelined attention differs from the unpipelined exchange")
+        return result
+
+
+    def _pipelined_transport(self, rx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int,
+                             groups: int) -> torch.Tensor:
+        """_pipelined's schedule over the manager's transport (2 ranks). The pack writes the transport's send buffer;
+        every group's q, k, v slot is posted at once on the main stream; per group the exchange stream waits for its
+        slot and copies it into device memory (a transport such as spark_rdma keeps its buffers in host-pinned memory,
+        which the GPU does not hold in L2, so attention must read a device copy) while the main stream runs the previous
+        group's attention; each group's output goes back through its own slot. Slots are reused by every layer: a slot
+        is posted only after the previous layer's consumers of it (the call ends with the main stream waiting for the
+        exchange stream)."""
+        manager = self.manager
+        world, rank, comm = manager.world_size, manager.rank, manager.pipeline_stream
+        peer = 1 - rank
+        _, t, hidden = q.shape
+        head_dim = hidden // heads
+        hg = heads // world // groups
+        main = torch.cuda.current_stream()
+        key = (groups, world, t, hg, head_dim, q.dtype)
+        buffers = manager.pipeline_buffers.get(key)
+        if buffers is None:
+            buffers = [torch.empty(key[:5], dtype=q.dtype, device=q.device) for _ in range(7)]
+            manager.pipeline_buffers[key] = buffers
+        recv, gathered = buffers[3:6], buffers[6]
+        bq = 3 * t * hg * head_dim * q.element_size()
+        send_qkv = rx.view("send", 0, (groups, 3, t, hg, head_dim), q.dtype)
+        recv_qkv = rx.view("recv", 0, (groups, 3, t, hg, head_dim), q.dtype)
+        send_out = rx.view("send", groups * bq, (groups, t, hg, head_dim), q.dtype)
+        recv_out = rx.view("recv", groups * bq, (groups, t, hg, head_dim), q.dtype)
+        for i, x in enumerate((q, k, v)):
+            grouped = x.view(t, world, groups, hg, head_dim).permute(2, 1, 0, 3, 4)
+            send_qkv[:, i].copy_(grouped[:, peer])
+            recv[i][:, rank].copy_(grouped[:, rank])
+        for g in range(groups):
+            rx.post(g, main)
+        ready = [torch.cuda.Event() for _ in range(groups)]
+        comm.wait_stream(main)
+        with torch.cuda.stream(comm):
+            for g in range(groups):
+                rx.wait(g, comm)
+                for i in range(3):
+                    recv[i][g, peer].copy_(recv_qkv[g, i])
+                ready[g].record(comm)
+        outputs = []
+        for g in range(groups):
+            main.wait_event(ready[g])
+            q_g, k_g, v_g = (recv[i][g].view(1, world * t, hg * head_dim) for i in range(3))
+            parts = {"part": g, "parts": groups} if self.original_attention_accepts_parts else {}
+            out = self.original_attention(q=q_g, k=k_g, v=v_g, heads=hg, **parts).reshape(1, world * t, hg, head_dim)
+            outputs.append(out)
+            gathered[g, rank].copy_(out[0, rank * t:(rank + 1) * t])
+            done = torch.cuda.Event()
+            done.record(main)
+            with torch.cuda.stream(comm):
+                comm.wait_event(done)
+                send_out[g].copy_(out[0, peer * t:(peer + 1) * t])
+                rx.post(groups + g, comm)
+                rx.wait(groups + g, comm)
+                gathered[g, peer].copy_(recv_out[g])
+        main.wait_stream(comm)
+        for out in outputs:
+            out.record_stream(comm)
+        if rx.error():
+            raise RuntimeError("v4 pipeline transport error")
+        result = gathered.permute(2, 1, 0, 3, 4).reshape(1, t, heads * head_dim)
+        if self._checks > 0:
+            self._checks -= 1
+            extra = {"count": False} if self.original_attention_accepts_parts else {}
+            same = bool(torch.equal(result, self._reference(q, k, v, heads, **extra)))
+            print(f"[v4 transport] rank {rank} groups {groups} heads {heads} tokens {t}: equal to the unpipelined "
+                  f"exchange {same}", flush=True)
+            if not same:
+                raise RuntimeError("transport-pipelined attention differs from the unpipelined exchange")
         return result
 
 
