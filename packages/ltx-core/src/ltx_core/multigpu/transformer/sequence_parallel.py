@@ -26,6 +26,7 @@ from ltx_core.multigpu.transformer.attention import (
     AudioAll2AllAttention,
     MaskedAll2AllAttention,
     MaskedAudioAll2AllAttention,
+    PipelinedAll2AllAttention,
 )
 
 
@@ -251,7 +252,12 @@ def create_video_self_attention_module_ops(
             if hasattr(block, "attn1"):
                 attn1 = block.attn1
                 if isinstance(attn1, Attention):
-                    attn1.attention_function = All2AllAttention(attention_manager, attn1.attention_function)
+                    # v4: head-group pipelined exchanges when SPARK_CP_PIPELINE_GROUPS > 1 (attention.py); with
+                    # SPARK_CP_GRAPH_BREAK_PROBE=1 its unpipelined fallback, run outside the compiled graph.
+                    pipelined = (attention_manager.pipeline_groups > 1
+                                 or os.environ.get("SPARK_CP_GRAPH_BREAK_PROBE", "0") == "1")
+                    wrapper = PipelinedAll2AllAttention if pipelined else All2AllAttention
+                    attn1.attention_function = wrapper(attention_manager, attn1.attention_function)
                     attn1.masked_attention_function = MaskedAll2AllAttention(
                         attention_manager, attn1.masked_attention_function
                     )
