@@ -8,6 +8,7 @@ from ltx_core.model.transformer.attention import AttentionCallable, MaskedAttent
 # Mirrors the kernel's DEFAULT_BARRIER_TIMEOUT_SECONDS (configs.cuh), which All2All converts to
 # cycles via the device peak SM clock. Stored so the timeout can be read back to reset after a raise.
 _DEFAULT_ALL2ALL_TIMEOUT_SECONDS = 10.0
+_GRAPH_BREAK_PROBE = os.environ.get("SPARK_CP_GRAPH_BREAK_PROBE", "0") == "1"
 
 
 class AttentionManager:
@@ -61,6 +62,29 @@ class AttentionManager:
         )
         self.group = group
         self._all2all_timeout_seconds = _DEFAULT_ALL2ALL_TIMEOUT_SECONDS
+        # v4 head-group pipeline (PipelinedAll2AllAttention, ulysses_head_pipeline): its NCCL exchanges use their own
+        # communicator with a high-priority internal stream (SPARK_CP_PIPELINE_HIGH_PRIORITY), so that a group's NCCL
+        # kernel gets SMs while the attention grid runs.
+        # v4 SPARK_CP_PACK_IN_GRAPH: the head pack before each exchange is graph code (NCCLAll2All
+        # send_recv_heads_packed), so Inductor writes it from the producing kernel instead of a separate copy.
+        self.pack_in_graph = (
+            os.environ.get("SPARK_CP_PACK_IN_GRAPH", "0") == "1"
+            and self.world_size > 1
+            and hasattr(self.all2all_q, "send_recv_heads_packed")
+        )
+        self.pipeline_groups = int(os.environ.get("SPARK_CP_PIPELINE_GROUPS", "1"))
+        self.pipeline_group = None
+        if self.pipeline_groups > 1 and self.world_size > 1:
+            options = dist.ProcessGroupNCCL.Options()
+            options.is_high_priority_stream = os.environ.get("SPARK_CP_PIPELINE_HIGH_PRIORITY", "1") == "1"
+            ranks = dist.get_process_group_ranks(group) if group is not None else list(range(self.world_size))
+            self.pipeline_group = dist.new_group(ranks=ranks, backend="nccl", pg_options=options)
+        # Optional transport for the pipeline's exchanges instead of NCCL (2 ranks), set by the caller before the first
+        # pipelined call: a ulysses_head_pipeline transport factory (group, nbytes, slots) -> transport, e.g.
+        # ulysses_head_pipeline.spark_rdma.factory(...) (RDMA from host-pinned buffers on DGX Spark, which has no
+        # GPUDirect RDMA). If creating it fails on either rank, both keep NCCL.
+        self.pipeline_transport_factory = None
+        self.pipeline = None  # ulysses_head_pipeline.HeadGroupPipeline, made at the first pipelined call
 
     def set_seqlen_all2all(self, seqlens: list[int]) -> None:
         # Route through the wrappers so the registered custom ops' fake-impl
@@ -92,6 +116,12 @@ class AttentionManager:
         if self.async_qkv:
             t_q, t_k, t_v = self.all2all_q.send_recv_async([q, k, v], copy_out=self.copy_out)
             return t_q, t_k, t_v
+        if self.pack_in_graph:
+            return (
+                self.all2all_q.send_recv_heads_packed(q),
+                self.all2all_k.send_recv_heads_packed(k),
+                self.all2all_v.send_recv_heads_packed(v),
+            )
         t_q = self.all2all_q.send_recv_heads(q, copy_out=self.copy_out)
         t_k = self.all2all_k.send_recv_heads(k, copy_out=self.copy_out)
         t_v = self.all2all_v.send_recv_heads(v, copy_out=self.copy_out)
@@ -157,6 +187,96 @@ class All2AllAttention(AttentionCallable):
         return self._sp.gather(hidden_states, local_heads, head_dim)
 
 
+class PipelinedAll2AllAttention(AttentionCallable):
+    """Self-attention SP wrapper with the Ulysses exchanges pipelined over head groups (v4, SPARK_CP_PIPELINE_GROUPS).
+
+    The schedule is ulysses_head_pipeline.HeadGroupPipeline (gitlab-master georgel/ulysses-head-pipeline; imported
+    only when enabled): each rank's local heads (heads / world) split into G groups; after one pack of q, k, v, every
+    group's exchange is queued at once on the pipeline's high-priority exchange stream (NCCL on the manager's own
+    communicator, or the manager's transport), the attention of group g runs as soon as its data arrived, and each
+    group's output goes back to its token owners as soon as its attention is done. Separate collectives do not overlap
+    on GB10: the attention grid takes every SM before the next NCCL kernel can start (h3-unified-20261027
+    bench/bench_overlap.py). The inner attention is called once per group; Sol-Attn routes per (query block, head) and
+    the dense path is per head too, so the result equals the unpipelined one (SPARK_CP_PIPELINE_CHECK=N compares the
+    first N calls in the run). Falls back to the unpipelined exchange for B != 1, cross-attention shapes or head counts
+    G does not divide.
+    """
+
+    def __init__(self, manager: AttentionManager, original_attention: AttentionCallable):
+        self._sp = _All2AllRedistribute(manager)
+        self.manager = manager
+        self.original_attention = original_attention
+        # Set by the Stage 2 Sol-Attn adapter when its callable counts one layer per group sequence (part, parts).
+        self.original_attention_accepts_parts = False
+        self._checks = int(os.environ.get("SPARK_CP_PIPELINE_CHECK", "0"))
+
+    def _reference(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, **kwargs: bool) -> torch.Tensor:
+        t_q, t_k, t_v, local_heads, head_dim = self._sp.redistribute(q, k, v, heads)
+        hidden_states = self.original_attention(q=t_q, k=t_k, v=t_v, heads=local_heads, **kwargs)
+        return self._sp.gather(hidden_states, local_heads, head_dim)
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        heads: int,
+    ) -> torch.Tensor:
+        groups, world = self.manager.pipeline_groups, self.manager.world_size
+        if (
+            self.manager.pipeline_group is None
+            or heads % (world * groups)
+            or q.shape[0] != 1
+            or k.shape != q.shape
+            or v.shape != q.shape
+        ):
+            if _GRAPH_BREAK_PROBE and q.shape[0] == 1 and k.shape == q.shape and v.shape == q.shape:
+                return self._reference_outside_graph(q, k, v, heads)
+            return self._reference(q, k, v, heads)
+        return self._pipelined(q, k, v, heads, groups)
+
+    # SPARK_CP_GRAPH_BREAK_PROBE=1 (diagnosis): the unpipelined exchange, same values, run outside the compiled graph
+    # exactly where _pipelined is, to tell the graph break's cost from the pipeline's.
+    @torch.compiler.disable
+    def _reference_outside_graph(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int) -> torch.Tensor:
+        return self._reference(q, k, v, heads)
+
+    @torch.compiler.disable
+    def _pipelined(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, groups: int) -> torch.Tensor:
+        manager = self.manager
+        if manager.pipeline is None:
+            from ulysses_head_pipeline import HeadGroupPipeline  # noqa: PLC0415 -- optional, only when pipelined
+
+            manager.pipeline = HeadGroupPipeline(
+                manager.pipeline_group, groups, manager.pipeline_transport_factory, priority=-1, name="v4 transport"
+            )
+        _, t, hidden = q.shape
+        head_dim = hidden // heads
+
+        def attention(x: torch.Tensor, group: int) -> torch.Tensor:
+            # x: (3, world * t, hg, d), group g's q, k, v over all tokens
+            tokens, hg = x.shape[1], x.shape[2]
+            q_g, k_g, v_g = (y.view(1, tokens, hg * head_dim) for y in x)
+            parts = {"part": group, "parts": groups} if self.original_attention_accepts_parts else {}
+            return self.original_attention(q=q_g, k=k_g, v=v_g, heads=hg, **parts).reshape(tokens, hg, head_dim)
+
+        result = manager.pipeline.run([x.view(t, heads, head_dim) for x in (q, k, v)], attention)
+        result = result.view(1, t, hidden)  # rank r's heads r*lh + g*hg + j, as gather_heads
+        if self._checks > 0:
+            self._checks -= 1
+            extra = {"count": False} if self.original_attention_accepts_parts else {}
+            same = bool(torch.equal(result, self._reference(q, k, v, heads, **extra)))
+            label = "v4 pipeline" if manager.pipeline.describe() == "nccl" else "v4 transport"
+            print(  # noqa: T201 -- the run's log, as the unpipelined path's checks
+                f"[{label}] rank {manager.rank} groups {groups} heads {heads} tokens {t}: equal to the unpipelined "
+                f"exchange {same}",
+                flush=True,
+            )
+            if not same:
+                raise RuntimeError("pipelined attention differs from the unpipelined exchange")
+        return result
+
+
 class MaskedAll2AllAttention(MaskedAttentionCallable):
     def __init__(self, manager: AttentionManager, original_attention: MaskedAttentionCallable):
         self._sp = _All2AllRedistribute(manager)
@@ -205,6 +325,9 @@ class _AudioAll2AllRedistribute:
         t_q = q[:, :, heads_per_rank * rank : heads_per_rank * (rank + 1), :].clone()
         if self.manager.async_qkv:
             t_k, t_v = self.manager.all2all_k.send_recv_async([k, v], copy_out=self.manager.copy_out)
+        elif self.manager.pack_in_graph:
+            t_k = self.manager.all2all_k.send_recv_heads_packed(k)
+            t_v = self.manager.all2all_v.send_recv_heads_packed(v)
         else:
             t_k = self.manager.all2all_k.send_recv_heads(k, copy_out=self.manager.copy_out)
             t_v = self.manager.all2all_v.send_recv_heads(v, copy_out=self.manager.copy_out)
