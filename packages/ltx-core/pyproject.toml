@@ -5,6 +5,8 @@ description = "Core implementation of Lightricks' LTX-2 model"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    # Sol-H3-Spark: installed RDMA package shared with the unified environment.
+    "ulysses-head-pipeline @ git+ssh://git@gitlab-master.nvidia.com:12051/georgel/ulysses-head-pipeline.git@e35219a3f55e1f7fa09f865a286858f5adc49529",
     "torch~=2.7",
     "torchaudio",
     "einops",

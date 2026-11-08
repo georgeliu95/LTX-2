@@ -173,13 +173,19 @@ Each package includes comprehensive documentation:
 
 ## Sol-H3-Spark RDMA integration
 
-The `h3-spark-unified` branch uses external `ulysses_head_pipeline` source for
-the Sol demo's CUDA payload collectives and head-group pipeline. Supply the
-four-rank package on `PYTHONPATH`, including `mesh`, `collective_ops`, and
-`fused`; the older two-rank package is insufficient. This dependency is provided
-by the Sol deployment, without a pip requirement or Git submodule pin here.
-The modified multigpu modules require it at import time. CPU control groups
-use Gloo; CUDA payloads use RDMA.
+The `h3-spark-unified` branch uses the installed `ulysses-head-pipeline`
+package for the Sol demo's CUDA payload collectives and head-group pipeline.
+`packages/ltx-core/pyproject.toml` pins the same full Git commit as the Sol
+demo's `requirements/rdma.txt`. Install that requirement with
+`uv pip install --python /path/to/unified-env/bin/python --no-deps -r
+requirements/rdma.txt` from Sol-H3-Spark in its prepared Python 3.12 environment.
+GitLab SSH access is required; an offline wheel from the same revision also
+works.
+
+The package includes `mesh`, `collective_ops` and `fused` and resolves through
+normal imports from `site-packages`. Do not copy its source into the deployment
+or add its checkout to `PYTHONPATH`. The modified multigpu modules require it
+at import time. CPU control groups use Gloo; CUDA payloads use RDMA.
 
 `SPARK_CP_COALESCE_AUDIO_KV=1` combines audio K/V into one packed exchange. It
 requires `SPARK_CP_PACK_IN_GRAPH=1` and synchronous QKV exchange. The attention
