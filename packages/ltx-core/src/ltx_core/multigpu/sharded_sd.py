@@ -5,6 +5,7 @@ caller-provided staging buffer.
 """
 
 from __future__ import annotations
+from ulysses_head_pipeline import collective_ops as rdma_ops
 
 import hashlib
 from dataclasses import dataclass
@@ -148,7 +149,7 @@ class ShardedSD:
             if filled == 0:
                 continue
             view = staging[:filled]
-            dist.broadcast(view, src=owner, group=self.group)
+            rdma_ops.broadcast(view, src=owner, group=self.group)
 
             cursor = 0
             for k, offset, chunk_size in round_chunks:

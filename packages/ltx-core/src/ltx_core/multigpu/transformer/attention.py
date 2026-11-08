@@ -1,3 +1,4 @@
+from ulysses_head_pipeline import collective_ops as rdma_ops
 import os
 
 import torch
@@ -33,6 +34,9 @@ class AttentionManager:
         num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         self.copy_out = copy_out_
         self.async_qkv = os.environ.get("SPARK_CP_ASYNC_QKV", "0") == "1"
+        self.coalesce_audio_kv = os.environ.get("SPARK_CP_COALESCE_AUDIO_KV", "0") == "1"
+        if self.coalesce_audio_kv and self.async_qkv:
+            raise ValueError("audio K/V coalescing requires synchronous pack_in_graph exchanges")
         buffer_seqlen = (max_tokens + self.world_size - 1) // self.world_size
         self.all2all_heads, self.all2all_q = (
             All2All(
@@ -72,13 +76,13 @@ class AttentionManager:
             and self.world_size > 1
             and hasattr(self.all2all_q, "send_recv_heads_packed")
         )
+        if self.coalesce_audio_kv and not self.pack_in_graph:
+            raise ValueError("audio K/V coalescing requires SPARK_CP_PACK_IN_GRAPH=1 and a packed transport")
         self.pipeline_groups = int(os.environ.get("SPARK_CP_PIPELINE_GROUPS", "1"))
         self.pipeline_group = None
         if self.pipeline_groups > 1 and self.world_size > 1:
-            options = dist.ProcessGroupNCCL.Options()
-            options.is_high_priority_stream = os.environ.get("SPARK_CP_PIPELINE_HIGH_PRIORITY", "1") == "1"
             ranks = dist.get_process_group_ranks(group) if group is not None else list(range(self.world_size))
-            self.pipeline_group = dist.new_group(ranks=ranks, backend="nccl", pg_options=options)
+            self.pipeline_group = dist.new_group(ranks=ranks, backend="gloo")
         # Optional transport for the pipeline's exchanges instead of NCCL (2 ranks), set by the caller before the first
         # pipelined call: a ulysses_head_pipeline transport factory (group, nbytes, slots) -> transport, e.g.
         # ulysses_head_pipeline.spark_rdma.factory(...) (RDMA from host-pinned buffers on DGX Spark, which has no
@@ -260,7 +264,9 @@ class PipelinedAll2AllAttention(AttentionCallable):
             parts = {"part": group, "parts": groups} if self.original_attention_accepts_parts else {}
             return self.original_attention(q=q_g, k=k_g, v=v_g, heads=hg, **parts).reshape(tokens, hg, head_dim)
 
-        result = manager.pipeline.run([x.view(t, heads, head_dim) for x in (q, k, v)], attention)
+        inputs = [x.view(t, heads, head_dim) for x in (q, k, v)]
+        fusion = getattr(self, "pipeline_fusion", None)
+        result = manager.pipeline.run(inputs, attention) if fusion is None else fusion.run(manager.pipeline, inputs)
         result = result.view(1, t, hidden)  # rank r's heads r*lh + g*hg + j, as gather_heads
         if self._checks > 0:
             self._checks -= 1
@@ -326,8 +332,17 @@ class _AudioAll2AllRedistribute:
         if self.manager.async_qkv:
             t_k, t_v = self.manager.all2all_k.send_recv_async([k, v], copy_out=self.manager.copy_out)
         elif self.manager.pack_in_graph:
-            t_k = self.manager.all2all_k.send_recv_heads_packed(k)
-            t_v = self.manager.all2all_v.send_recv_heads_packed(v)
+            if self.manager.coalesce_audio_kv:
+                if k.shape != v.shape or k.dtype != v.dtype or k.device != v.device:
+                    raise ValueError("coalesced audio K/V must share shape, dtype and device")
+                # K batches precede V batches. The existing packed exchange preserves batch order
+                # while gathering source-rank tokens; split its result without another copy.
+                kv = torch.stack((k, v), dim=0).flatten(0, 1)
+                received = self.manager.all2all_k.send_recv_heads_packed(kv)
+                t_k, t_v = received.unflatten(0, (2, k.shape[0])).unbind(0)
+            else:
+                t_k = self.manager.all2all_k.send_recv_heads_packed(k)
+                t_v = self.manager.all2all_v.send_recv_heads_packed(v)
         else:
             t_k = self.manager.all2all_k.send_recv_heads(k, copy_out=self.manager.copy_out)
             t_v = self.manager.all2all_v.send_recv_heads(v, copy_out=self.manager.copy_out)
@@ -349,7 +364,7 @@ class _AudioAll2AllRedistribute:
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        dist.all_gather_into_tensor(gathered, hidden_states, group=self.manager.group)
+        rdma_ops.all_gather_into_tensor(gathered, hidden_states, group=self.manager.group)
         # (heads, B, S, head_dim) -> (B, S, heads, head_dim) -> (B, S, heads * head_dim)
         return gathered.permute(1, 2, 0, 3).flatten(-2)
 

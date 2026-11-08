@@ -7,6 +7,7 @@ using sequence parallelism. It:
 - Runs the model forward pass on each GPU with its local tile
 - Gathers all tokens back to all GPUs after the forward pass
 """
+from ulysses_head_pipeline import collective_ops as rdma_ops
 
 import os
 from dataclasses import replace
@@ -217,7 +218,7 @@ def gather_output_tokens(
 
     # All gather padded outputs
     gathered_list = [torch.zeros_like(padded_local) for _ in range(world_size)]
-    torch.distributed.all_gather(gathered_list, padded_local, group=group)
+    rdma_ops.all_gather(gathered_list, padded_local, group=group)
 
     # Extract actual tokens (remove padding) and concatenate
     outputs = []

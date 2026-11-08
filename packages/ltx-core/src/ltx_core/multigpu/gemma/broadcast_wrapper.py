@@ -1,6 +1,7 @@
 """Shared base for the multi-GPU Gemma wrappers: src-rank gating + NCCL broadcast."""
 
 from __future__ import annotations
+from ulysses_head_pipeline import collective_ops as rdma_ops
 
 import torch
 import torch.distributed as dist
@@ -114,7 +115,7 @@ class BroadcastGemmaWrapper(torch.nn.Module, Disposable):
             attention_mask = attention_mask.to(device=self._device)
 
         for h in hidden_states:
-            dist.broadcast(h, src=src_rank, group=self._group)
-        dist.broadcast(attention_mask, src=src_rank, group=self._group)
+            rdma_ops.broadcast(h, src=src_rank, group=self._group)
+        rdma_ops.broadcast(attention_mask, src=src_rank, group=self._group)
 
         return hidden_states, attention_mask

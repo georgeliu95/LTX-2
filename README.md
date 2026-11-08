@@ -170,3 +170,28 @@ Each package includes comprehensive documentation:
 * **[LTX-Core README](packages/ltx-core/README.md)** - Core model implementation, inference stack, and utilities
 * **[LTX-Pipelines README](packages/ltx-pipelines/README.md)** - High-level pipeline implementations and usage guides
 * **[LTX-Trainer README](packages/ltx-trainer/README.md)** - Training and fine-tuning documentation with detailed guides
+
+## Sol-H3-Spark RDMA integration
+
+The `h3-spark-unified` branch uses external `ulysses_head_pipeline` source for
+the Sol demo's CUDA payload collectives and head-group pipeline. Supply the
+four-rank package on `PYTHONPATH`, including `mesh`, `collective_ops`, and
+`fused`; the older two-rank package is insufficient. This dependency is provided
+by the Sol deployment, without a pip requirement or Git submodule pin here.
+The modified multigpu modules require it at import time. CPU control groups
+use Gloo; CUDA payloads use RDMA.
+
+`SPARK_CP_COALESCE_AUDIO_KV=1` combines audio K/V into one packed exchange. It
+requires `SPARK_CP_PACK_IN_GRAPH=1` and synchronous QKV exchange. The attention
+wrapper also accepts the Sol integration's `pipeline_fusion` input/output
+callbacks. Four-rank fusion is configured by Sol's
+`SPARK_CP_LTX_FUSE_INPUT` and `SPARK_CP_LTX_FUSE_OUTPUT` options; summaries stay
+on the compute stream. See the matching Sol-H3-Spark README for deployment
+requirements and the shared-container handoff.
+
+The CPU layout regression exercises rank, batch, K/V ordering, repeated calls,
+and independent output storage:
+
+```bash
+python -m pytest packages/ltx-core/tests/test_ltx_coalesced_kv.py
+```
